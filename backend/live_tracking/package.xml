@@ -1,0 +1,13 @@
+<package>
+  <name>live-tracker</name>
+  <version>1.0.0</version>
+  <description>Simple live tracking app (Leaflet + Socket.IO)</description>
+  <main>server.js</main>
+  <scripts>
+    <start>node server.js</start>
+  </scripts>
+  <dependencies>
+    <express>^4.18.2</express>
+    <socket.io>^4.7.2</socket.io>
+  </dependencies>
+</package>
