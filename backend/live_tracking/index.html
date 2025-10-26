@@ -1,0 +1,262 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Live Tracker</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+
+  <style>
+    *{box-sizing:border-box}
+    html,body,#app{height:100%;margin:0;padding:0;font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial}
+    #app{display:flex;height:100vh}
+    #map{flex:1}
+    #controls{
+      width:320px;
+      padding:12px;
+      background:#f7f8fa;
+      border-left:1px solid #ddd;
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+    }
+    #controls input {width:150px;padding:6px}
+    #controls .btns button {margin-right:8px;padding:8px 10px}
+    #info div{margin-top:8px}
+  </style>
+</head>
+<body>
+  <div id="app">
+    <div id="map"></div>
+    <div id="controls">
+      <div>
+        Session ID: <input id="sessionId" type="text" />
+        <button id="joinBtn">Join</button>
+      </div>
+      <div class="btns">
+        <button id="startBtn">Start Tracking</button>
+        <button id="stopBtn" disabled>Stop</button>
+        <button id="overviewBtn" disabled>Overview</button>
+      </div>
+      <div id="info">
+        <div>Distance: <span id="distance">0</span> m</div>
+        <div>Duration: <span id="duration">0</span> s</div>
+        <div>Points: <span id="points">0</span></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/socket.io/socket.io.js"></script>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+
+  <script>
+    // client.js - handles geolocation, drawing on map, and socket comms
+    const socket = io();
+
+    // --- Map setup ---
+    const map = L.map("map", { center: [20.5937, 78.9629], zoom: 5 });
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+      attribution: "© OpenStreetMap contributors"
+    }).addTo(map);
+
+    let liveMarker = null;
+    let startMarker = null;
+    let endMarker = null;
+    let polyline = L.polyline([], { weight: 4 }).addTo(map);
+
+    let tracking = false;
+    let watchId = null;
+    let sessionId = "";
+    let path = []; // local copy of points
+    let startedAt = null;
+    let endedAt = null;
+
+    // UI elements
+    const sessionInput = document.getElementById("sessionId");
+    const joinBtn = document.getElementById("joinBtn");
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn = document.getElementById("stopBtn");
+    const overviewBtn = document.getElementById("overviewBtn");
+    const distanceEl = document.getElementById("distance");
+    const durationEl = document.getElementById("duration");
+    const pointsEl = document.getElementById("points");
+
+    // If there's a session in URL query ?s=..., prefill
+    const urlParams = new URLSearchParams(window.location.search);
+    if (urlParams.get("s")) sessionInput.value = urlParams.get("s");
+
+    // Join session
+    joinBtn.onclick = () => {
+      sessionId = sessionInput.value.trim() || generateSessionId();
+      sessionInput.value = sessionId;
+      socket.emit("join-session", sessionId);
+      socket.on("session-data", (s) => {
+        resetLocal();
+        if (s && s.path && s.path.length) {
+          s.path.forEach(p => addPointLocal(p, false));
+          updateUI();
+        }
+        overviewBtn.disabled = false;
+      });
+      socket.on("new-point", (p) => {
+        addPointLocal(p, false);
+        updateUI();
+      });
+      socket.on("session-finished", (s) => {
+        endedAt = s.endedAt || endedAt;
+        updateUI();
+      });
+
+      alert("Joined session: " + sessionId + "\nShare the Session ID with others to view this track.");
+    };
+
+    function generateSessionId() {
+      return Math.random().toString(36).slice(2, 9);
+    }
+
+    // start / stop tracking
+    startBtn.onclick = async () => {
+      if (!sessionInput.value.trim()) {
+        sessionId = generateSessionId();
+        sessionInput.value = sessionId;
+        socket.emit("join-session", sessionId);
+      } else {
+        sessionId = sessionInput.value.trim();
+        socket.emit("join-session", sessionId);
+      }
+
+      if (!navigator.geolocation) {
+        return alert("Geolocation not available in this browser.");
+      }
+
+      tracking = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      overviewBtn.disabled = true;
+      startedAt = Date.now();
+
+      watchId = navigator.geolocation.watchPosition(onPosition, onGeoError, {
+        enableHighAccuracy: true,
+        maximumAge: 1000,
+        timeout: 10000
+      });
+    };
+
+    stopBtn.onclick = () => {
+      if (!tracking) return;
+      tracking = false;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      overviewBtn.disabled = false;
+
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+
+      endedAt = Date.now();
+      socket.emit("finish-session", { sessionId });
+      updateUI();
+    };
+
+    overviewBtn.onclick = () => {
+      if (path.length === 0) return;
+      const latlngs = path.map(p => [p.lat, p.lon]);
+      const bounds = L.latLngBounds(latlngs);
+      map.fitBounds(bounds.pad(0.2));
+    };
+
+    function onPosition(position) {
+      const lat = position.coords.latitude;
+      const lon = position.coords.longitude;
+      const t = position.timestamp || Date.now();
+      socket.emit("location-update", { sessionId, lat, lon, timestamp: t });
+      const localPoint = { lat, lon, t };
+      addPointLocal(localPoint, true);
+      updateUI();
+    }
+
+    function onGeoError(err) {
+      console.error("geolocation error", err);
+    }
+
+    function addPointLocal(point, broadcasted) {
+      path.push(point);
+      polyline.addLatLng([point.lat, point.lon]);
+
+      if (!liveMarker) {
+        liveMarker = L.circleMarker([point.lat, point.lon], { radius: 7 }).addTo(map);
+      } else {
+        liveMarker.setLatLng([point.lat, point.lon]);
+      }
+
+      if (path.length === 1) {
+        startMarker = L.marker([point.lat, point.lon], { title: "Start" }).addTo(map).bindPopup("Start").openPopup();
+        startedAt = startedAt || point.t;
+        map.setView([point.lat, point.lon], 16);
+      }
+
+      if (endMarker) {
+        endMarker.setLatLng([point.lat, point.lon]);
+      } else {
+        endMarker = L.marker([point.lat, point.lon], { title: "End" }).addTo(map).bindPopup("End");
+      }
+
+      if (path.length <= 5) {
+        const latlngs = path.map(p => [p.lat, p.lon]);
+        map.fitBounds(L.latLngBounds(latlngs).pad(0.2));
+      }
+    }
+
+    function resetLocal() {
+      path = [];
+      startedAt = null;
+      endedAt = null;
+      if (polyline) polyline.setLatLngs([]);
+      if (liveMarker) { map.removeLayer(liveMarker); liveMarker=null;}
+      if (startMarker) { map.removeLayer(startMarker); startMarker=null;}
+      if (endMarker) { map.removeLayer(endMarker); endMarker=null;}
+    }
+
+    function updateUI() {
+      pointsEl.innerText = path.length;
+      distanceEl.innerText = Math.round(computeTotalDistance(path));
+      durationEl.innerText = Math.round(computeDurationSec());
+      overviewBtn.disabled = path.length < 2;
+    }
+
+    function computeTotalDistance(points) {
+      if (points.length < 2) return 0;
+      let sum = 0;
+      for (let i = 1; i < points.length; ++i) {
+        sum += haversine(points[i-1].lat, points[i-1].lon, points[i].lat, points[i].lon);
+      }
+      return sum;
+    }
+
+    function computeDurationSec() {
+      if (!startedAt) return 0;
+      const end = endedAt || (path.length ? path[path.length-1].t : Date.now());
+      return (end - startedAt) / 1000;
+    }
+
+    function haversine(lat1, lon1, lat2, lon2) {
+      function toRad(x){ return x * Math.PI / 180; }
+      const R = 6371000;
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon/2) * Math.sin(dLon/2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    }
+
+    setInterval(updateUI, 1000);
+
+    if (sessionInput.value.trim()) {
+      joinBtn.click();
+    }
+  </script>
+</body>
+</html>
